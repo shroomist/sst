@@ -9,6 +9,7 @@ import {
   CustomResource,
 } from "aws-cdk-lib";
 import { Effect, Policy, PolicyStatement } from "aws-cdk-lib/aws-iam";
+import { Fn, Duration as CdkDuration, RemovalPolicy, Stack } from "aws-cdk-lib";
 import { RetentionDays } from "aws-cdk-lib/aws-logs";
 import {
   Function as CdkFunction,
@@ -41,6 +42,12 @@ import { SsrFunction } from "./SsrFunction.js";
 import { EdgeFunction } from "./EdgeFunction.js";
 import { SsrSite, SsrSiteProps } from "./SsrSite.js";
 import { Size, toCdkSize } from "./util/size.js";
+import { IRole, PolicyStatement } from "aws-cdk-lib/aws-iam";
+import { Bucket, BucketProps, IBucket } from "aws-cdk-lib/aws-s3";
+import { isCDKConstruct } from "./Construct.js";
+import { BucketDeployment, Source } from "aws-cdk-lib/aws-s3-deployment";
+import { IQueue, Queue } from "aws-cdk-lib/aws-sqs";
+import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
 
@@ -56,11 +63,21 @@ export interface NextjsSiteProps extends Omit<SsrSiteProps, "nodejs"> {
      */
     memorySize?: number | Size;
   };
+  cdk?: SsrSiteProps["cdk"] & {
+    cacheBucket?: BucketProps | IBucket;
+  };
   /**
    * The number of server functions to keep warm. This option is only supported for the regional mode.
    * @default Server function is not kept warm
    */
   warm?: number;
+  /*
+   * Enable cache interception.
+   * Open next will try to intercept ssg and isr requests and serve them from cache.
+   * Enabling this will not trigger middleware on the server side.
+   * @default false
+   */
+  enableExperimentalCacheInterception?: boolean;
 }
 
 /**
@@ -80,19 +97,78 @@ export class NextjsSite extends SsrSite {
     runtime: Exclude<NextjsSiteProps["runtime"], undefined>;
     timeout: Exclude<NextjsSiteProps["timeout"], undefined>;
     memorySize: Exclude<NextjsSiteProps["memorySize"], undefined>;
-    waitForInvalidation: Exclude<
-      NextjsSiteProps["waitForInvalidation"],
-      undefined
-    >;
+    waitForInvalidation: Exclude<NextjsSiteProps["waitForInvalidation"], undefined>;
   };
+  cacheBucket: IBucket;
+  revalidationQueue: IQueue;
+  revalidationFn: CdkFunction;
 
   constructor(scope: Construct, id: string, props?: NextjsSiteProps) {
     super(scope, id, {
       buildCommand: "npx --yes open-next@^1.3 build",
       ...props,
     });
-
+    this.cacheBucket = this.createCacheBucket(props?.enableExperimentalCacheInterception);
+    const { revalidationFn, queue } = this.createRevalidation();
+    this.revalidationFn = revalidationFn;
+    this.revalidationQueue = queue;
     this.createWarmer();
+  }
+
+  private createCacheBucket(cacheInterception = false): IBucket {
+    let _bucket: Bucket;
+    const { cdk } = this.props;
+    if (cdk?.cacheBucket && isCDKConstruct(cdk.cacheBucket)) {
+      _bucket = cdk.cacheBucket as Bucket;
+    } else {
+      const bucketProps = cdk?.cacheBucket as BucketProps;
+      _bucket = new Bucket(this, "CacheBucket", {
+        ...bucketProps,
+      });
+    }
+    const deployment = new BucketDeployment(this, "CacheBucketDeployment", {
+      sources: [Source.asset(path.join(this.props.path, ".open-next", "cache"))],
+      destinationBucket: _bucket,
+    });
+
+    this.cdk?.function?.addEnvironment("CACHE_BUCKET_NAME", _bucket.bucketName);
+    this.cdk?.function?.addEnvironment("ORIGIN_REGION", Stack.of(this).region);
+    if (cacheInterception) {
+      this.cdk?.function?.addEnvironment("EXPERIMENTAL_CACHE_INTERCEPTION", "true");
+    }
+    if (this.cdk?.function?.role) {
+      _bucket.grantReadWrite(this.cdk.function.role);
+    }
+
+    return deployment.deployedBucket;
+  }
+
+  protected createRevalidation() {
+    const queue = new Queue(this, "RevalidationQueue", {
+      fifo: true,
+    });
+    const revalidationFn = new CdkFunction(this, "RevalidationFunction", {
+      handler: "index.handler",
+      code: Code.fromAsset(
+        path.join(this.props.path, ".open-next", "revalidation-function")
+      ),
+      runtime: Runtime.NODEJS_18_X,
+      timeout: CdkDuration.seconds(30),
+      environment: {
+        HOST: this.cdk?.distribution?.domainName as string,
+      },
+    });
+    revalidationFn.addEventSource(
+      new SqsEventSource(queue, {
+        batchSize: 5,
+      })
+    );
+    this.cdk?.function?.addEnvironment("REVALIDATION_QUEUE_URL", queue.queueUrl);
+    if (this.cdk?.function?.role) {
+      queue.grantSendMessages(this.cdk.function.role);
+    }
+    queue.grantConsumeMessages(revalidationFn);
+    return { revalidationFn, queue };
   }
 
   protected initBuildConfig() {
@@ -105,15 +181,8 @@ export class NextjsSite extends SsrSite {
   }
 
   protected createFunctionForRegional(): CdkFunction {
-    const {
-      runtime,
-      timeout,
-      memorySize,
-      bind,
-      permissions,
-      environment,
-      cdk,
-    } = this.props;
+    const { runtime, timeout, memorySize, bind, permissions, environment, cdk } =
+      this.props;
     const ssrFn = new SsrFunction(this, `ServerFunction`, {
       description: "Next.js server",
       bundle: path.join(this.props.path, ".open-next", "server-function"),
@@ -130,9 +199,8 @@ export class NextjsSite extends SsrSite {
   }
 
   protected createFunctionForEdge(): EdgeFunction {
-    const { runtime, timeout, memorySize, bind, permissions, environment } =
-      this.props;
-    return new EdgeFunction(this, "ServerFunction", {
+    const { runtime, timeout, memorySize, bind, permissions, environment } = this.props;
+    const edgeFn = new EdgeFunction(this, "ServerFunction", {
       bundle: path.join(this.props.path, ".open-next", "server-function"),
       handler: "index.handler",
       runtime,
@@ -142,6 +210,7 @@ export class NextjsSite extends SsrSite {
       permissions,
       environment,
     });
+    return edgeFn;
   }
 
   private createImageOptimizationFunction(): CdkFunction {
@@ -154,9 +223,7 @@ export class NextjsSite extends SsrSite {
         removalPolicy: RemovalPolicy.DESTROY,
       },
       logRetention: RetentionDays.THREE_DAYS,
-      code: Code.fromAsset(
-        path.join(sitePath, ".open-next/image-optimization-function")
-      ),
+      code: Code.fromAsset(path.join(sitePath, ".open-next/image-optimization-function")),
       runtime: Runtime.NODEJS_18_X,
       memorySize: imageOptimization?.memorySize
         ? typeof imageOptimization.memorySize === "string"
